@@ -1,0 +1,56 @@
+name: Receive Telemetry
+
+on:
+  repository_dispatch:
+    types: [telemetry_upload]
+
+permissions:
+  contents: write
+
+jobs:
+  receive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate and Save Report
+        run: |
+          # Extract payload
+          PAYLOAD='${{ toJson(github.event.client_payload) }}'
+
+          # Generate filename with timestamp
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          REPORT_ID=$(echo "$PAYLOAD" | jq -r '.upload_id // empty' | head -c 8)
+
+          if [ -z "$REPORT_ID" ]; then
+            REPORT_ID=$(openssl rand -hex 4)
+          fi
+
+          FILENAME="data/reports/${TIMESTAMP}_${REPORT_ID}.json"
+
+          # Validate JSON structure
+          if echo "$PAYLOAD" | jq -e '.reports' > /dev/null 2>&1; then
+            echo "Valid telemetry report received"
+
+            # Save report
+            echo "$PAYLOAD" | jq '.' > "$FILENAME"
+
+            echo "Saved to: $FILENAME"
+          else
+            echo "Invalid payload structure - missing 'reports' field"
+            exit 1
+          fi
+
+      - name: Commit Report
+        run: |
+          git config user.name "MigrateMe Telemetry Bot"
+          git config user.email "telemetry@migrateme.local"
+          git add data/reports/
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Add telemetry report $(date +%Y-%m-%d)"
+            git push
+          fi

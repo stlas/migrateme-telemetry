@@ -1,0 +1,334 @@
+name: Aggregate Telemetry
+
+on:
+  # Run daily at 3 AM UTC
+  schedule:
+    - cron: '0 3 * * *'
+  # Manual trigger
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  WORKER_URL: https://migrateme-telemetry.stlas1967.workers.dev
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install cryptography
+
+      - name: Fetch and Decrypt Pending Uploads
+        env:
+          WORKER_SECRET: ${{ secrets.CLOUDFLARE_WORKER_SECRET }}
+          TELEMETRY_PRIVATE_KEY: ${{ secrets.TELEMETRY_PRIVATE_KEY }}
+        run: |
+          python3 << 'EOF'
+          import json
+          import urllib.request
+          import urllib.error
+          import base64
+          import os
+          import zlib
+          from pathlib import Path
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import padding
+          from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+          from cryptography.hazmat.backends import default_backend
+
+          WORKER_URL = os.environ["WORKER_URL"]
+          WORKER_SECRET = os.environ["WORKER_SECRET"]
+          PRIVATE_KEY_PEM = os.environ["TELEMETRY_PRIVATE_KEY"]
+          REPORTS_DIR = Path("data/reports")
+
+          def decrypt_data(encrypted_b64: str) -> dict:
+              """Decrypt telemetry data using private key"""
+              raw = base64.b64decode(encrypted_b64)
+
+              # Check for unencrypted fallback data
+              if raw.startswith(b'UNENC:'):
+                  decompressed = zlib.decompress(raw[6:])
+                  return json.loads(decompressed.decode('utf-8'))
+
+              # Unpack: key_length (2 bytes) + encrypted_key + iv (16 bytes) + encrypted_data
+              key_length = int.from_bytes(raw[:2], 'big')
+              encrypted_key = raw[2:2+key_length]
+              iv = raw[2+key_length:2+key_length+16]
+              encrypted_data_bytes = raw[2+key_length+16:]
+
+              # Load private key
+              private_key = serialization.load_pem_private_key(
+                  PRIVATE_KEY_PEM.encode(),
+                  password=None,
+                  backend=default_backend()
+              )
+
+              # Decrypt AES key with RSA
+              aes_key = private_key.decrypt(
+                  encrypted_key,
+                  padding.OAEP(
+                      mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                      algorithm=hashes.SHA256(),
+                      label=None
+                  )
+              )
+
+              # Decrypt data with AES
+              cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
+              decryptor = cipher.decryptor()
+              padded_data = decryptor.update(encrypted_data_bytes) + decryptor.finalize()
+
+              # Remove PKCS7 padding
+              padding_length = padded_data[-1]
+              json_bytes = padded_data[:-padding_length]
+
+              return json.loads(json_bytes.decode('utf-8'))
+
+          def main():
+              # Fetch pending uploads from Cloudflare Worker
+              req = urllib.request.Request(
+                  f"{WORKER_URL}/pending",
+                  headers={
+                      "Authorization": f"Bearer {WORKER_SECRET}",
+                      "Accept": "application/json"
+                  }
+              )
+
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as response:
+                      result = json.loads(response.read().decode('utf-8'))
+              except urllib.error.HTTPError as e:
+                  print(f"Error fetching pending uploads: {e.code}")
+                  return
+
+              uploads = result.get("uploads", [])
+              print(f"Found {len(uploads)} pending uploads")
+
+              if not uploads:
+                  print("No pending uploads to process")
+                  return
+
+              # Process and save each upload
+              REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+              processed_keys = []
+
+              for upload in uploads:
+                  try:
+                      upload_id = upload.get("id", "unknown")
+                      encrypted_data = upload.get("encrypted_data")
+
+                      if not encrypted_data:
+                          print(f"Skip {upload_id}: no encrypted data")
+                          continue
+
+                      # Decrypt
+                      decrypted = decrypt_data(encrypted_data)
+
+                      # Save as report file
+                      filename = f"report_{upload_id}.json"
+                      output_file = REPORTS_DIR / filename
+
+                      with open(output_file, 'w', encoding='utf-8') as f:
+                          json.dump(decrypted, f, indent=2, ensure_ascii=False)
+
+                      print(f"Saved: {filename}")
+                      processed_keys.append(upload.get("key"))
+
+                  except Exception as e:
+                      print(f"Error processing upload {upload.get('id')}: {e}")
+
+              # Mark as processed
+              if processed_keys:
+                  mark_req = urllib.request.Request(
+                      f"{WORKER_URL}/mark-processed",
+                      data=json.dumps({"keys": processed_keys}).encode('utf-8'),
+                      method="POST",
+                      headers={
+                          "Authorization": f"Bearer {WORKER_SECRET}",
+                          "Content-Type": "application/json"
+                      }
+                  )
+
+                  try:
+                      with urllib.request.urlopen(mark_req, timeout=30) as response:
+                          result = json.loads(response.read().decode('utf-8'))
+                          print(f"Marked {result.get('deleted', 0)} uploads as processed")
+                  except Exception as e:
+                      print(f"Error marking as processed: {e}")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+      - name: Aggregate Reports
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+          from datetime import datetime
+          from pathlib import Path
+          from collections import defaultdict
+
+          REPORTS_DIR = Path("data/reports")
+          OUTPUT_FILE = Path("data/aggregated/community_quality.json")
+
+          def calculate_stars(total: int, successes: int, restores: int) -> int:
+              """Calculate star rating based on community data"""
+              if total == 0:
+                  return 0
+
+              success_rate = successes / total
+
+              if total >= 100 and success_rate >= 0.95 and restores >= 5:
+                  return 5
+              elif total >= 50 and success_rate >= 0.90 and restores >= 1:
+                  return 4
+              elif total >= 20 and success_rate >= 0.80:
+                  return 3
+              elif total >= 5 and success_rate >= 0.50:
+                  return 2
+              elif total >= 1:
+                  return 1
+              return 0
+
+          def main():
+              # Aggregated data per program
+              programs = defaultdict(lambda: {
+                  "total_reports": 0,
+                  "successful_backups": 0,
+                  "successful_restores": 0,
+                  "discovered_paths": set(),
+                  "platforms": set()
+              })
+
+              # Process all report files
+              report_count = 0
+              for report_file in REPORTS_DIR.glob("*.json"):
+                  try:
+                      with open(report_file, 'r', encoding='utf-8') as f:
+                          data = json.load(f)
+
+                      reports = data.get("reports", [])
+                      for report in reports:
+                          name = report.get("program_name", "Unknown")
+                          success = report.get("success", False)
+                          restore_tested = report.get("restore_tested", False)
+                          paths = report.get("backup_paths", [])
+                          platform = report.get("platform", "unknown")
+
+                          programs[name]["total_reports"] += 1
+                          if success:
+                              programs[name]["successful_backups"] += 1
+                          if restore_tested:
+                              programs[name]["successful_restores"] += 1
+
+                          # Add discovered paths (already anonymized)
+                          for path in paths:
+                              programs[name]["discovered_paths"].add(path)
+
+                          programs[name]["platforms"].add(platform)
+
+                      report_count += 1
+
+                  except Exception as e:
+                      print(f"Error processing {report_file}: {e}")
+
+              # Calculate stars and convert sets to lists
+              output_programs = {}
+              for name, data in programs.items():
+                  stars = calculate_stars(
+                      data["total_reports"],
+                      data["successful_backups"],
+                      data["successful_restores"]
+                  )
+
+                  output_programs[name] = {
+                      "total_reports": data["total_reports"],
+                      "successful_backups": data["successful_backups"],
+                      "successful_restores": data["successful_restores"],
+                      "stars": stars,
+                      "discovered_paths": sorted(list(data["discovered_paths"])),
+                      "platforms": sorted(list(data["platforms"]))
+                  }
+
+              # Write output
+              output = {
+                  "last_updated": datetime.utcnow().isoformat() + "Z",
+                  "total_reports_processed": report_count,
+                  "total_programs": len(output_programs),
+                  "programs": dict(sorted(output_programs.items()))
+              }
+
+              OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+              with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+                  json.dump(output, f, indent=2, ensure_ascii=False)
+
+              print(f"Aggregated {report_count} reports into {len(output_programs)} programs")
+              print(f"Output: {OUTPUT_FILE}")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+      - name: Update Cloudflare Worker Community Data
+        env:
+          WORKER_SECRET: ${{ secrets.CLOUDFLARE_WORKER_SECRET }}
+        run: |
+          python3 << 'EOF'
+          import json
+          import urllib.request
+          import os
+          from pathlib import Path
+
+          WORKER_URL = os.environ.get("WORKER_URL", "https://migrateme-telemetry.stlas.workers.dev")
+          WORKER_SECRET = os.environ["WORKER_SECRET"]
+          COMMUNITY_FILE = Path("data/aggregated/community_quality.json")
+
+          if not COMMUNITY_FILE.exists():
+              print("No community data file found")
+              exit(0)
+
+          with open(COMMUNITY_FILE, 'r', encoding='utf-8') as f:
+              community_data = json.load(f)
+
+          # Update Cloudflare Worker with aggregated data
+          req = urllib.request.Request(
+              f"{WORKER_URL}/update-community",
+              data=json.dumps(community_data).encode('utf-8'),
+              method="POST",
+              headers={
+                  "Authorization": f"Bearer {WORKER_SECRET}",
+                  "Content-Type": "application/json"
+              }
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  result = json.loads(response.read().decode('utf-8'))
+                  print(f"Updated Cloudflare Worker: {result}")
+          except Exception as e:
+              print(f"Error updating Cloudflare Worker: {e}")
+          EOF
+
+      - name: Commit Aggregated Data
+        run: |
+          git config user.name "MigrateMe Telemetry Bot"
+          git config user.email "telemetry@migrateme.local"
+          git add data/
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update aggregated community data $(date +%Y-%m-%d)"
+            git push
+          fi
